@@ -3,6 +3,7 @@ setlocal
 title KIK Windows 11 Security Check
 echo Collecting information about your PC...
 
+REM Floris Wiesman, Klinische Informatiekunde, Amsterdam UMC
 REM This BAT contains an embedded PowerShell script.
 REM Edit the KB number in the PowerShell section below.
 set "KIK_SCRIPT_PATH=%~f0"
@@ -23,6 +24,13 @@ $RequiredKB = 'KB5127648'
 # ========================================================
 
 $ErrorActionPreference = 'Stop'
+
+# This tool must inspect the physical endpoint, not a Citrix/OneView session.
+if ($env:SESSIONNAME -match '(?i)^ICA-TCP' -or $env:CTXSESSIONID) {
+    Write-Host 'Error: Do not run this tool in OneView. It is for laptops and PCs only.' -ForegroundColor Red
+    exit 2
+}
+
 $results = [System.Collections.Generic.List[object]]::new()
 
 function Add-Result {
