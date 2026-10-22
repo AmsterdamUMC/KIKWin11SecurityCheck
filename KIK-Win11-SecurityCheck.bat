@@ -5,7 +5,8 @@ echo Collecting information about your PC...
 
 REM This BAT contains an embedded PowerShell script.
 REM Edit the KB number in the PowerShell section below.
-powershell.exe -NoLogo -NoProfile -Command "$p='%~f0'; $s=Get-Content -LiteralPath $p; $i=[Array]::IndexOf($s, ':POWERSHELL'); if ($i -lt 0) { throw 'PowerShell section not found.' }; $code=$s[($i+1)..($s.Length-1)] -join [Environment]::NewLine; & ([scriptblock]::Create($code))"
+set "KIK_SCRIPT_PATH=%~f0"
+powershell.exe -NoLogo -NoProfile -Command "$p=$env:KIK_SCRIPT_PATH; $s=Get-Content -LiteralPath $p; $i=[Array]::IndexOf($s, ':POWERSHELL'); if ($i -lt 0) { throw 'PowerShell section not found.' }; $code=$s[($i+1)..($s.Length-1)] -join [Environment]::NewLine; & ([scriptblock]::Create($code))"
 set "RC=%ERRORLEVEL%"
 echo.
 if not "%RC%"=="0" echo The check reported an error. Review the messages above.
@@ -32,11 +33,19 @@ function Add-Result {
         [string]$Notes = ''
     )
     $results.Add([pscustomobject]@{
-        Check  = $Check
-        Status = $Status
-        Value  = $Value
-        Notes  = $Notes
+        Check  = Protect-CsvValue $Check
+        Status = Protect-CsvValue $Status
+        Value  = Protect-CsvValue $Value
+        Notes  = Protect-CsvValue $Notes
     })
+}
+
+function Protect-CsvValue {
+    param([AllowNull()][string]$Value)
+    if ($null -ne $Value -and $Value -match '^[=+\-@]') {
+        return "'$Value"
+    }
+    return $Value
 }
 
 function Get-RegistryUninstallEntries {
@@ -60,6 +69,10 @@ function Get-DefaultBrowserInfo {
     $browser = switch -Regex ($progId) {
         'MSEdgeHTM' { 'Edge'; break }
         'ChromeHTML' { 'Chrome'; break }
+        'BraveHTML' { 'Brave'; break }
+        'OperaStable' { 'Opera'; break }
+        'ChromiumHTM' { 'Chromium'; break }
+        'VivaldiHTM' { 'Vivaldi'; break }
         'FirefoxURL|FirefoxHTML' { 'Firefox'; break }
         default { 'Unknown' }
     }
@@ -69,6 +82,13 @@ function Get-DefaultBrowserInfo {
 function Get-ChromiumUblockStatus {
     param([string]$BrowserName, [string]$UserDataPath)
 
+    $knownExtensionIds = @(
+        'cjpalhdlnbpafiamejdnhcphjbkeiagm' # Chrome Web Store
+        'odfafepnkmbhccpbejgmiehpchacaeak' # Microsoft Edge Add-ons
+        'ddkjiahejlhfcafbddmgiahcphecmpfh' # uBlock Origin Lite
+        'cimighlppcgcoapaliogpjjdehbnofhn' # Microsoft Edge uBlock Origin Lite
+    )
+
     if (-not (Test-Path -LiteralPath $UserDataPath)) {
         return [pscustomobject]@{ Status='UNKNOWN'; Value=''; Notes="$BrowserName profile folder not found." }
     }
@@ -77,24 +97,37 @@ function Get-ChromiumUblockStatus {
     $defaultProfile = Join-Path $UserDataPath 'Default'
     if (Test-Path -LiteralPath $defaultProfile) { $profiles += Get-Item -LiteralPath $defaultProfile }
     $profiles += Get-ChildItem -LiteralPath $UserDataPath -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^Profile \d+$' }
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'Preferences') }
+    $profiles = @($profiles | Sort-Object FullName -Unique)
 
     $matches = @()
     $couldRead = $false
     foreach ($profile in $profiles) {
-        $prefPath = Join-Path $profile.FullName 'Preferences'
-        if (-not (Test-Path -LiteralPath $prefPath)) { continue }
-        try {
+        $prefPaths = @(
+            (Join-Path $profile.FullName 'Preferences')
+            (Join-Path $profile.FullName 'Secure Preferences')
+        ) | Where-Object { Test-Path -LiteralPath $_ }
+        foreach ($prefPath in $prefPaths) {
+          try {
             $prefs = Get-Content -LiteralPath $prefPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             $settings = $prefs.extensions.settings
             if ($null -eq $settings) { continue }
             $couldRead = $true
             foreach ($prop in $settings.PSObject.Properties) {
                 $ext = $prop.Value
-                $name = [string]$ext.manifest.name
                 $id = [string]$prop.Name
-                if ($name -match '(?i)^ublock' -or $id -eq 'cjpalhdlnbpafiamejdnhcphjbkeiagm') {
-                    $enabled = ($null -ne $ext.state -and [int]$ext.state -eq 1)
+                if ($knownExtensionIds -contains $id) {
+                    $name = [string]$ext.manifest.name
+                    if ($ext.disable_reasons -is [array]) {
+                        $hasDisableReason = $ext.disable_reasons.Count -gt 0
+                    } elseif ($null -eq $ext.disable_reasons) {
+                        $hasDisableReason = $false
+                    } else {
+                        $hasDisableReason = [int]$ext.disable_reasons -ne 0
+                    }
+                    # Chromium versions increasingly use disable_reasons as the
+                    # authoritative state; the legacy state field can be stale.
+                    $enabled = -not $hasDisableReason
                     $displayName = if ($name) { $name } else { "uBlock (name not available; ID $id)" }
                     $matches += [pscustomobject]@{
                         Profile = $profile.Name
@@ -103,15 +136,17 @@ function Get-ChromiumUblockStatus {
                     }
                 }
             }
-        } catch {
+          } catch {
             # A browser may be running and its Preferences file may be locked or temporarily incomplete.
+          }
         }
     }
 
     if ($matches.Count -gt 0) {
         $enabledMatches = @($matches | Where-Object Enabled)
         $summary = ($matches | ForEach-Object {
-            "$($_.Name) in $($_.Profile): " + $(if ($_.Enabled) {'enabled'} else {'not enabled'})
+            $stateText = if ($null -eq $_.Enabled) {'state unknown'} elseif ($_.Enabled) {'enabled'} else {'not enabled'}
+            "$($_.Name) in $($_.Profile): $stateText"
         }) -join '; '
         if ($enabledMatches.Count -gt 0) {
             return [pscustomobject]@{ Status='OK'; Value=$summary; Notes='Profiles found in browser data; browser may have multiple profiles.' }
@@ -120,31 +155,54 @@ function Get-ChromiumUblockStatus {
     }
 
     if ($couldRead) {
-        return [pscustomobject]@{ Status='NOT OK'; Value='No enabled uBlock extension found'; Notes='The readable profiles contain no extension whose name starts with uBlock (or the known uBlock Origin ID).' }
+        return [pscustomobject]@{ Status='NOT OK'; Value='No enabled uBlock extension found'; Notes='The readable profiles contain no recognized uBlock extension with a trusted browser-store ID.' }
     }
     return [pscustomobject]@{ Status='UNKNOWN'; Value=''; Notes='No usable extension data could be read. Close the browser and try again.' }
 }
 
 function Get-FirefoxUblockStatus {
-    $base = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
-    if (-not (Test-Path -LiteralPath $base)) {
+    $firefoxRoot = Join-Path $env:APPDATA 'Mozilla\Firefox'
+    $base = Join-Path $firefoxRoot 'Profiles'
+    if (-not (Test-Path -LiteralPath $firefoxRoot)) {
         return [pscustomobject]@{ Status='UNKNOWN'; Value=''; Notes='Firefox profile folder not found.' }
     }
+    $profilePaths = @()
+    $profilesIni = Join-Path $firefoxRoot 'profiles.ini'
+    if (Test-Path -LiteralPath $profilesIni) {
+        $section = @{}
+        foreach ($line in (Get-Content -LiteralPath $profilesIni -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\[Profile\d+\]$') {
+                if ($section.Path) {
+                    $profilePaths += if ($section.IsRelative -eq '1') { Join-Path $firefoxRoot $section.Path } else { $section.Path }
+                }
+                $section = @{}
+            } elseif ($line -match '^(Path|IsRelative)=(.*)$') {
+                $section[$matches[1]] = $matches[2]
+            }
+        }
+        if ($section.Path) {
+            $profilePaths += if ($section.IsRelative -eq '1') { Join-Path $firefoxRoot $section.Path } else { $section.Path }
+        }
+    }
+    if (Test-Path -LiteralPath $base) {
+        $profilePaths += @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    }
+    $profilePaths = @($profilePaths | Where-Object { $_ } | Select-Object -Unique)
     $found = @()
     $couldRead = $false
-    foreach ($profile in (Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue)) {
-        $extFile = Join-Path $profile.FullName 'extensions.json'
+    foreach ($profilePath in $profilePaths) {
+        $extFile = Join-Path $profilePath 'extensions.json'
         if (-not (Test-Path -LiteralPath $extFile)) { continue }
         try {
             $data = Get-Content -LiteralPath $extFile -Raw | ConvertFrom-Json
             $couldRead = $true
             foreach ($ext in $data.addons) {
-                $name = [string]$ext.defaultLocale.name
                 $id = [string]$ext.id
-                if ($name -match '(?i)^ublock' -or $id -eq 'uBlock0@raymondhill.net') {
+                if ($id -in @('uBlock0@raymondhill.net', 'uBOLite@raymondhill.net')) {
+                    $name = [string]$ext.defaultLocale.name
                     $active = [bool]$ext.active
                     $displayName = if ($name) { $name } else { "uBlock (name not available; ID $id)" }
-                    $found += [pscustomobject]@{ Profile=$profile.Name; Name=$displayName; Active=$active }
+                    $found += [pscustomobject]@{ Profile=(Split-Path $profilePath -Leaf); Name=$displayName; Active=$active }
                 }
             }
         } catch {}
@@ -159,7 +217,7 @@ function Get-FirefoxUblockStatus {
         return [pscustomobject]@{ Status='NOT OK'; Value=$summary; Notes='uBlock found, but not enabled.' }
     }
     if ($couldRead) {
-        return [pscustomobject]@{ Status='NOT OK'; Value='No enabled uBlock extension found'; Notes='No matching extension found in the readable Firefox profiles.' }
+        return [pscustomobject]@{ Status='NOT OK'; Value='No enabled uBlock extension found'; Notes='No uBlock Origin extension with the trusted Firefox ID was found in the readable profiles.' }
     }
     return [pscustomobject]@{ Status='UNKNOWN'; Value=''; Notes='Extension data not available.' }
 }
@@ -168,8 +226,16 @@ function Get-AvProductState {
     param([uint32]$ProductState)
     $rtByte = ($ProductState -shr 8) -band 0xFF
     $sigByte = $ProductState -band 0xFF
-    $enabled = ($rtByte -band 0xF0) -eq 0x10
-    $signaturesCurrent = ($sigByte -band 0xF0) -eq 0x00
+    $enabled = switch ($rtByte -band 0xF0) {
+        0x10 { $true; break }
+        0x00 { $false; break }
+        default { $null }
+    }
+    $signaturesCurrent = switch ($sigByte -band 0xF0) {
+        0x00 { $true; break }
+        0x10 { $false; break }
+        default { $null }
+    }
     return [pscustomobject]@{ Enabled = $enabled; SignaturesCurrent = $signaturesCurrent }
 }
 
@@ -182,8 +248,23 @@ function Get-McAfeeStatus {
     }
 
     $displayName = ($mcafeeProducts | ForEach-Object { $_.displayName } | Where-Object { $_ } | Select-Object -Unique) -join '; '
-    $productState = $mcafeeProducts[0].productState
-    $avState = Get-AvProductState -ProductState $productState
+    $productStates = @($mcafeeProducts | ForEach-Object {
+        $rawState = $_.productState
+        $state = if ($null -eq $rawState -or [string]::IsNullOrWhiteSpace([string]$rawState)) {
+            [pscustomobject]@{ Enabled = $null; SignaturesCurrent = $null }
+        } else {
+            Get-AvProductState -ProductState ([uint32]$rawState)
+        }
+        [pscustomobject]@{
+            Product = $_.displayName
+            State = $state
+            RawState = $rawState
+        }
+    })
+    $enabledStates = @($productStates | ForEach-Object { $_.State.Enabled } | Where-Object { $null -ne $_ })
+    $signatureStates = @($productStates | ForEach-Object { $_.State.SignaturesCurrent } | Where-Object { $null -ne $_ })
+    $wscEnabled = if (@($enabledStates | Where-Object { $_ }).Count -gt 0) { $true } elseif ($enabledStates.Count -eq $productStates.Count) { $false } else { $null }
+    $wscSignaturesCurrent = if (@($signatureStates | Where-Object { $_ }).Count -gt 0) { $true } elseif ($signatureStates.Count -eq $productStates.Count) { $false } else { $null }
 
     $installedProducts = @()
     try {
@@ -255,9 +336,9 @@ function Get-McAfeeStatus {
         AllVersions = $version
         DATVersion = $datVersion
         RealTimeEnabled = $realTimeEnabled
-        WscEnabled = $avState.Enabled
-        WscSignaturesCurrent = $avState.SignaturesCurrent
-        WscState = ('0x{0:X}' -f $productState)
+        WscEnabled = $wscEnabled
+        WscSignaturesCurrent = $wscSignaturesCurrent
+        WscState = (($productStates | ForEach-Object { '{0}: 0x{1:X}' -f $_.Product, $_.RawState }) -join '; ')
     }
 }
 
@@ -269,7 +350,8 @@ try {
     $os = Get-CimInstance Win32_OperatingSystem
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $winValue = "$($os.Caption); version $($cv.DisplayVersion); build $($os.BuildNumber)"
-    Add-Result 'Windows version' 'OK' $winValue 'Check that the device is using Windows 11.'
+    $winStatus = if ($os.Caption -match '^Microsoft Windows 11\b') { 'OK' } else { 'NOT OK' }
+    Add-Result 'Windows version' $winStatus $winValue 'The check requires a Microsoft Windows 11 client operating system.'
 
     # Antivirus products registered with Windows Security Center
     $avProducts = @()
@@ -278,7 +360,7 @@ try {
     } catch {}
     $avNames = @($avProducts | ForEach-Object { $_.displayName } | Where-Object { $_ } | Select-Object -Unique)
     if ($avNames.Count -gt 0) {
-        Add-Result 'Antivirus registered' 'OK' ($avNames -join '; ') 'Windows Security Center lists these products; this alone does not prove that all protection functions work.'
+        Add-Result 'Antivirus registered' 'UNKNOWN' ($avNames -join '; ') 'Windows Security Center lists these products, but registration alone does not prove that protection is enabled or current.'
     } else {
         Add-Result 'Antivirus registered' 'UNKNOWN' '' 'No antivirus product could be read via Windows Security Center.'
     }
@@ -288,8 +370,15 @@ try {
     try {
         $mp = Get-MpComputerStatus -ErrorAction Stop
         $defenderAvailable = $true
-        $defenderStatus = if ($mp.AntivirusEnabled -and $mp.RealTimeProtectionEnabled) {'OK'} else {'NOT OK'}
-        Add-Result 'Microsoft Defender active and real-time protection' $defenderStatus "AntivirusEnabled=$($mp.AntivirusEnabled); RealTimeProtectionEnabled=$($mp.RealTimeProtectionEnabled)" 'With another primary antivirus, Defender may intentionally be in passive mode.'
+        $thirdPartyAv = @($avProducts | Where-Object { $_.displayName -and $_.displayName -notmatch '(?i)Microsoft Defender|Windows Defender' }).Count -gt 0
+        if ($thirdPartyAv -and $mp.AMRunningMode -eq 'Passive') {
+            $defenderStatus = 'NOT APPLICABLE'
+            $defenderNote = 'Microsoft Defender is passive because another antivirus is registered as the primary product.'
+        } else {
+            $defenderStatus = if ($mp.AntivirusEnabled -and $mp.RealTimeProtectionEnabled) {'OK'} else {'NOT OK'}
+            $defenderNote = 'With another primary antivirus, Defender may intentionally be in passive mode.'
+        }
+        Add-Result 'Microsoft Defender active and real-time protection' $defenderStatus "AntivirusEnabled=$($mp.AntivirusEnabled); RealTimeProtectionEnabled=$($mp.RealTimeProtectionEnabled); AMRunningMode=$($mp.AMRunningMode)" $defenderNote
         $sigDate = $mp.AntivirusSignatureLastUpdated
         if ($sigDate) {
             $sigStatus = if ((Get-Date) - $sigDate -le [TimeSpan]::FromDays(3)) {'OK'} else {'NOT OK'}
@@ -315,10 +404,10 @@ try {
     if ($mcafee.Detected) {
         $mcafeeVersionValue = if ($mcafee.InstalledProducts) { $mcafee.InstalledProducts } elseif ($mcafee.AllVersions) { "McAfee $($mcafee.AllVersions)" } else { $mcafee.DisplayName }
         Add-Result 'McAfee installed products' 'OK' $mcafeeVersionValue 'Versions found in registry uninstall data; consumer McAfee products may not expose real-time protection or definition status via standard interfaces.'
-        $mcafeeRtText = if ($mcafee.WscEnabled) {'enabled'} else {'disabled'}
-        $mcafeeSigText = if ($mcafee.WscSignaturesCurrent) {'up to date'} else {'out of date'}
+        $mcafeeRtText = if ($null -eq $mcafee.WscEnabled) {'unknown'} elseif ($mcafee.WscEnabled) {'enabled'} else {'disabled'}
+        $mcafeeSigText = if ($null -eq $mcafee.WscSignaturesCurrent) {'unknown'} elseif ($mcafee.WscSignaturesCurrent) {'up to date'} else {'out of date'}
         $mcafeeValue = "Product=$($mcafee.DisplayName); real-time protection $mcafeeRtText; definitions $mcafeeSigText; DAT=$($mcafee.DATVersion)"
-        $mcafeeStatus = if ($mcafee.WscEnabled) {'OK'} else {'NOT OK'}
+        $mcafeeStatus = if ($null -eq $mcafee.WscEnabled) {'UNKNOWN'} elseif ($mcafee.WscEnabled) {'OK'} else {'NOT OK'}
         Add-Result 'McAfee antivirus enabled (Windows Security Center)' $mcafeeStatus $mcafeeValue 'Enabled state decoded from Windows Security Center productState. SignaturesCurrent reflects WSC freshness flag.'
         if ($mcafee.DATVersion) {
             Add-Result 'Last McAfee virus definition update' 'UNKNOWN' $mcafee.DATVersion 'DAT version retrieved; age check not available via standard cmdlets.'
@@ -332,21 +421,44 @@ try {
         Add-Result 'Required Windows update' 'UNKNOWN' $RequiredKB 'Enter a valid KB number at the top of the script, e.g. KB1234567.'
     } else {
         $kbFound = $false
+        $packageCheckAvailable = $false
         try {
             $null = Get-HotFix -Id $kb -ErrorAction Stop
             $kbFound = $true
         } catch {}
         if (-not $kbFound) {
-            # DISM can list packages not returned by Get-HotFix; this is a secondary check.
+            # Get-WindowsPackage provides structured package state for updates that
+            # are not exposed through Win32_QuickFixEngineering/Get-HotFix.
             try {
-                $dismOutput = & dism.exe /Online /Get-Packages /Format:Table 2>$null
-                if (($dismOutput -join "`n") -match [regex]::Escape($kb)) { $kbFound = $true }
+                $packages = @(Get-WindowsPackage -Online -ErrorAction Stop)
+                $packageCheckAvailable = $true
+                $kbPattern = "(?i)(^|[^A-Z0-9])$([regex]::Escape($kb))([^A-Z0-9]|$)"
+                $kbFound = @($packages | Where-Object {
+                    $_.PackageState -eq 'Installed' -and
+                    ([string]$_.PackageName -match $kbPattern)
+                }).Count -gt 0
+            } catch {}
+        }
+        if (-not $kbFound -and -not $packageCheckAvailable) {
+            # DISM /Format:List is a fallback for systems without the cmdlet.
+            try {
+                $dismText = (& dism.exe /English /Online /Get-Packages /Format:List 2>$null | Out-String)
+                if ($dismText) {
+                    $packageCheckAvailable = $true
+                    $kbPattern = "(?i)(^|[^A-Z0-9])$([regex]::Escape($kb))([^A-Z0-9]|$)"
+                    $packageBlocks = $dismText -split '(?m)(?=^Package Identity\s*:)' | Where-Object { $_ }
+                    $kbFound = @($packageBlocks | Where-Object {
+                        $_ -match '(?im)^State\s*:\s*Installed\s*$' -and $_ -match $kbPattern
+                    }).Count -gt 0
+                }
             } catch {}
         }
         if ($kbFound) {
-            Add-Result 'Required Windows update' 'OK' "$kb installed" 'Check via Get-HotFix and additional DISM. Some update forms are not shown in both sources.'
+            Add-Result 'Required Windows update' 'OK' "$kb installed" 'Checked Get-HotFix and structured Windows package state. This verifies the exact KB; a superseding update may require a separate baseline policy.'
+        } elseif (-not $packageCheckAvailable) {
+            Add-Result 'Required Windows update' 'UNKNOWN' "$kb could not be verified" 'Neither Get-HotFix nor structured Windows package inventory was available.'
         } else {
-            Add-Result 'Required Windows update' 'NOT OK' "$kb not found" 'Not found via Get-HotFix or DISM. Check manually via Windows Update history if needed; some updates are registered differently.'
+            Add-Result 'Required Windows update' 'NOT OK' "$kb not found" 'Not found as an installed package via Get-HotFix or structured Windows package inventory. A superseding update may require a separate baseline policy.'
         }
     }
 
@@ -376,10 +488,37 @@ try {
         $devEnc = "$sku"
         if ($sku -eq 101) {
             $sbText = if ($secureBoot -eq 1) {'SecureBoot enabled'} elseif ($secureBoot -eq 0) {'SecureBoot disabled'} else {'SecureBoot state unknown'}
-            $devEncValue = "Home edition (SKU $sku); $sbText. Device Encryption is the Home alternative to BitLocker management; check Settings - Privacy and security - Device encryption."
-            Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' $devEncValue 'BitLocker management is not available on Home; enable Device Encryption in Settings if supported by the hardware.'
+            $systemDrive = $env:SystemDrive
+            $volume = Get-CimInstance -Namespace 'root/CIMV2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$systemDrive'" -ErrorAction Stop
+            $conversionText = switch ([int]$volume.ConversionStatus) {
+                0 { 'Fully decrypted' }
+                1 { 'Fully encrypted' }
+                2 { 'Encryption in progress' }
+                3 { 'Decryption in progress' }
+                4 { 'Encryption paused' }
+                5 { 'Decryption paused' }
+                default { "Unknown ($($volume.ConversionStatus))" }
+            }
+            $protectionText = switch ([int]$volume.ProtectionStatus) {
+                0 { 'off' }
+                1 { 'on' }
+                2 { 'unknown' }
+                default { "unknown ($($volume.ProtectionStatus))" }
+            }
+            $devEncValue = "Home edition (SKU $sku); Drive=$systemDrive; ConversionStatus=$conversionText; ProtectionStatus=$protectionText; $sbText"
+            if ([int]$volume.ConversionStatus -eq 1 -and [int]$volume.ProtectionStatus -eq 1) {
+                Add-Result 'Device Encryption (Windows Home alternative)' 'OK' $devEncValue 'Encryption and protection reported by Win32_EncryptableVolume.'
+            } elseif ([int]$volume.ConversionStatus -eq 0 -or [int]$volume.ProtectionStatus -eq 0) {
+                Add-Result 'Device Encryption (Windows Home alternative)' 'NOT OK' $devEncValue 'Device Encryption is not fully enabled on the system drive.'
+            } else {
+                Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' $devEncValue 'Device Encryption is transitioning or the status could not be interpreted.'
+            }
         }
-    } catch {}
+    } catch {
+        if ($sku -eq 101) {
+            Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' '' 'Win32_EncryptableVolume could not report Device Encryption status; the feature may be unavailable or permissions may be missing.'
+        }
+    }
 
     # Default browser and uBlock extension
     $browserInfo = Get-DefaultBrowserInfo
@@ -395,6 +534,18 @@ try {
             }
             'Chrome' {
                 $browserResult = Get-ChromiumUblockStatus 'Chrome' (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data')
+            }
+            'Brave' {
+                $browserResult = Get-ChromiumUblockStatus 'Brave' (Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\User Data')
+            }
+            'Opera' {
+                $browserResult = Get-ChromiumUblockStatus 'Opera' (Join-Path $env:APPDATA 'Opera Software\Opera Stable')
+            }
+            'Chromium' {
+                $browserResult = Get-ChromiumUblockStatus 'Chromium' (Join-Path $env:LOCALAPPDATA 'Chromium\User Data')
+            }
+            'Vivaldi' {
+                $browserResult = Get-ChromiumUblockStatus 'Vivaldi' (Join-Path $env:LOCALAPPDATA 'Vivaldi\User Data')
             }
             'Firefox' {
                 $browserResult = Get-FirefoxUblockStatus
@@ -435,8 +586,13 @@ try {
     if (-not $documents -or -not (Test-Path -LiteralPath $documents)) {
         $documents = $env:TEMP
     }
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
     $reportPath = Join-Path $documents "WindowsSecurityCheck_$($env:COMPUTERNAME)_$timestamp.csv"
+    $suffix = 1
+    while (Test-Path -LiteralPath $reportPath) {
+        $reportPath = Join-Path $documents "WindowsSecurityCheck_$($env:COMPUTERNAME)_$timestamp`_$suffix.csv"
+        $suffix++
+    }
     $results | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
     Write-Host ''
     Write-Host 'Windows 11 security check completed.' -ForegroundColor Cyan
