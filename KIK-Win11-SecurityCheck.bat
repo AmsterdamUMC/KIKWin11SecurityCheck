@@ -473,16 +473,92 @@ try {
     # BitLocker system drive
     try {
         $systemDrive = $env:SystemDrive
-        $bl = Get-BitLockerVolume -MountPoint $systemDrive -ErrorAction Stop
-        $blStatus = [string]$bl.ProtectionStatus
-        $blPercent = [string]$bl.EncryptionPercentage
-        $blValue = "Drive=$systemDrive; VolumeStatus=$($bl.VolumeStatus); ProtectionStatus=$blStatus; EncryptionPercentage=$blPercent"
-        if ($bl.ProtectionStatus -eq 'On' -and $bl.EncryptionPercentage -eq 100) {
-            Add-Result 'BitLocker on system drive' 'OK' $blValue
-        } elseif ($bl.ProtectionStatus -eq 'Off' -or $bl.EncryptionPercentage -lt 100) {
-            Add-Result 'BitLocker on system drive' 'NOT OK' $blValue 'Check whether encryption and protection are required according to organizational policy.'
+        $blDetected = $false
+        $blValue = ''
+        $blStatusResult = 'UNKNOWN'
+        
+        # Try Get-BitLockerVolume first
+        try {
+            $bl = Get-BitLockerVolume -MountPoint $systemDrive -ErrorAction Stop
+            $blStatus = [string]$bl.ProtectionStatus
+            $blPercent = [string]$bl.EncryptionPercentage
+            $blValue = "Drive=$systemDrive; VolumeStatus=$($bl.VolumeStatus); ProtectionStatus=$blStatus; EncryptionPercentage=$blPercent"
+            $blDetected = $true
+            if ($bl.ProtectionStatus -eq 'On' -and $bl.EncryptionPercentage -eq 100) {
+                $blStatusResult = 'OK'
+            } elseif ($bl.ProtectionStatus -eq 'Off' -or $bl.EncryptionPercentage -lt 100) {
+                $blStatusResult = 'NOT OK'
+            } else {
+                $blStatusResult = 'UNKNOWN'
+            }
+        } catch {
+            # Fallback to manage-bde
+            try {
+                $mbde = & manage-bde -status $systemDrive 2>&1 | Out-String
+                if ($mbde -and $mbde -notmatch '(?i)access denied' -and $mbde -notmatch '(?i)ERROR:') {
+                    $blValue = ($mbde -replace "`r`n", '; ' -replace "`n", '; ') -replace '\s+', ' '
+                    $blValue = $blValue.Trim()
+                    if ($mbde -match '(?i)Protection Status:\s*(\w+)') {
+                        $prot = $matches[1]
+                        if ($mbde -match '(?i)Percentage Encrypted:\s*([\d.]+)') {
+                            $pct = [double]$matches[1]
+                            if ($prot -match '(?i)On' -and $pct -ge 99) {
+                                $blStatusResult = 'OK'
+                            } elseif ($prot -match '(?i)Off' -or $pct -lt 100) {
+                                $blStatusResult = 'NOT OK'
+                            } else {
+                                $blStatusResult = 'UNKNOWN'
+                            }
+                        } else {
+                            if ($prot -match '(?i)On') { $blStatusResult = 'OK' } else { $blStatusResult = 'NOT OK' }
+                        }
+                    } elseif ($mbde -match '(?i)Conversion Status:\s*(.+?)(?:;|$)') {
+                        $conv = $matches[1]
+                        if ($conv -match '(?i)Fully Encrypted') { $blStatusResult = 'OK' } elseif ($conv -match '(?i)Fully Decrypted') { $blStatusResult = 'NOT OK' } else { $blStatusResult = 'UNKNOWN' }
+                    } else {
+                        $blStatusResult = 'UNKNOWN'
+                    }
+                    $blDetected = $true
+                }
+            } catch {}
+            
+            # Fallback to WMI Win32_EncryptableVolume
+            if (-not $blDetected) {
+                try {
+                    $vol = Get-CimInstance -Namespace 'root/CIMV2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$systemDrive'" -ErrorAction Stop
+                    if ($vol) {
+                        $conv = switch ([int]$vol.ConversionStatus) { 0 {'FullyDecrypted'} 1 {'FullyEncrypted'} 2 {'Encrypting'} 3 {'Decrypting'} 4 {'EncryptionPaused'} 5 {'DecryptionPaused'} default {"Unknown($($vol.ConversionStatus))"} }
+                        $prot = switch ([int]$vol.ProtectionStatus) { 0 {'Off'} 1 {'On'} 2 {'Unknown'} default {"Unknown($($vol.ProtectionStatus))"} }
+                        try {
+                            $protStatus = $vol | Invoke-CimMethod -MethodName GetProtectionStatus -ErrorAction SilentlyContinue
+                            if ($protStatus -and $null -ne $protStatus.ProtectionStatus) {
+                                $prot = switch ([int]$protStatus.ProtectionStatus) { 0 {'Off'} 1 {'On'} 2 {'Unknown'} default {"Unknown($($protStatus.ProtectionStatus))"} }
+                            }
+                        } catch {}
+                        $blValue = "Drive=$systemDrive; ConversionStatus=$conv; ProtectionStatus=$prot (via WMI)"
+                        if ($prot -eq 'On' -and $conv -eq 'FullyEncrypted') {
+                            $blStatusResult = 'OK'
+                        } elseif ($prot -eq 'Off' -or $conv -eq 'FullyDecrypted') {
+                            $blStatusResult = 'NOT OK'
+                        } else {
+                            $blStatusResult = 'UNKNOWN'
+                        }
+                        $blDetected = $true
+                    }
+                } catch {}
+            }
+        }
+        
+        if ($blDetected) {
+            if ($blStatusResult -eq 'OK') {
+                Add-Result 'BitLocker on system drive' 'OK' $blValue
+            } elseif ($blStatusResult -eq 'NOT OK') {
+                Add-Result 'BitLocker on system drive' 'NOT OK' $blValue 'Check whether encryption and protection are required according to organizational policy.'
+            } else {
+                Add-Result 'BitLocker on system drive' 'UNKNOWN' $blValue 'Status could not be interpreted unambiguously.'
+            }
         } else {
-            Add-Result 'BitLocker on system drive' 'UNKNOWN' $blValue 'Status could not be interpreted unambiguously.'
+            Add-Result 'BitLocker on system drive' 'UNKNOWN' '' 'BitLocker status not readable; permissions may be missing, BitLocker may not be available or another encryption method may be used.'
         }
     } catch {
         Add-Result 'BitLocker on system drive' 'UNKNOWN' '' 'BitLocker status not readable; permissions may be missing, BitLocker may not be available or another encryption method may be used.'
