@@ -387,7 +387,7 @@ try {
         $mp = Get-MpComputerStatus -ErrorAction Stop
         $defenderAvailable = $true
         $thirdPartyAv = @($avProducts | Where-Object { $_.displayName -and $_.displayName -notmatch '(?i)Microsoft Defender|Windows Defender' }).Count -gt 0
-        if ($thirdPartyAv -and $mp.AMRunningMode -eq 'Passive') {
+        if ($thirdPartyAv -and $mp.AMRunningMode -in @('Passive', 'Not running')) {
             $defenderStatus = 'NOT APPLICABLE'
             $defenderNote = 'Microsoft Defender is passive because another antivirus is registered as the primary product.'
         } else {
@@ -403,13 +403,17 @@ try {
             Add-Result 'Last Defender virus definition update' 'UNKNOWN' '' 'Date not available.'
         }
 
-        $threats = @()
-        try { $threats = @(Get-MpThreat -ErrorAction Stop | Where-Object { $_.IsActive -eq $true }) } catch {}
-        if ($threats.Count -eq 0) {
-            Add-Result 'Active Microsoft Defender threats' 'OK' 'No active threats reported' 'This is no guarantee that the device is free of malware; the check depends on Defender and available rights.'
+        if ($thirdPartyAv -and $mp.AMRunningMode -in @('Passive', 'Not running')) {
+            Add-Result 'Active Microsoft Defender threats' 'N/A' '' 'Microsoft Defender is passive because another antivirus is registered as the primary product; check that antivirus for active threats.'
         } else {
-            $names = @($threats | ForEach-Object { "$($_.ThreatName) (ID $($_.ThreatID))" }) -join '; '
-            Add-Result 'Active Microsoft Defender threats' 'NOT OK' $names 'Check the notifications in Windows Security.'
+            $threats = @()
+            try { $threats = @(Get-MpThreat -ErrorAction Stop | Where-Object { $_.IsActive -eq $true }) } catch {}
+            if ($threats.Count -eq 0) {
+                Add-Result 'Active Microsoft Defender threats' 'OK' 'No active threats reported' 'This is no guarantee that the device is free of malware; the check depends on Defender and available rights.'
+            } else {
+                $names = @($threats | ForEach-Object { "$($_.ThreatName) (ID $($_.ThreatID))" }) -join '; '
+                Add-Result 'Active Microsoft Defender threats' 'NOT OK' $names 'Check the notifications in Windows Security.'
+            }
         }
     } catch {
         Add-Result 'Microsoft Defender checks' 'UNKNOWN' '' 'Defender status could not be read; Defender may not be available or another antivirus is active.'
