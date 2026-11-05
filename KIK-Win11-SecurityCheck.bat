@@ -25,6 +25,14 @@ $RequiredKB = 'KB5127648'
 
 $ErrorActionPreference = 'Stop'
 
+# Several Windows security providers require elevation. Continue in standard
+# user mode, but make the limitation explicit before collecting results.
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host 'Warning: Not running as admin; results will be inconclusive.' -ForegroundColor Yellow
+}
+
 # This tool must inspect the physical endpoint, not a Citrix/OneView session.
 if ($env:SESSIONNAME -match '(?i)^ICA-TCP' -or $env:CTXSESSIONID) {
     Write-Host 'Error: Do not run this tool in OneView. It is for laptops and PCs only.' -ForegroundColor Red
@@ -564,43 +572,89 @@ try {
         Add-Result 'BitLocker on system drive' 'UNKNOWN' '' 'BitLocker status not readable; permissions may be missing, BitLocker may not be available or another encryption method may be used.'
     }
 
-    # Device Encryption (Windows Home alternative to BitLocker management)
+    # Device Encryption (including Windows Home and automatic device encryption)
     try {
         $sku = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OperatingSystemSKU
+        $systemDrive = $env:SystemDrive
         $secureBoot = $null
         try { $secureBoot = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction Stop).UEFISecureBootEnabled } catch {}
-        $devEnc = "$sku"
-        if ($sku -eq 101) {
-            $sbText = if ($secureBoot -eq 1) {'SecureBoot enabled'} elseif ($secureBoot -eq 0) {'SecureBoot disabled'} else {'SecureBoot state unknown'}
-            $systemDrive = $env:SystemDrive
+        $sbText = if ($secureBoot -eq 1) {'SecureBoot enabled'} elseif ($secureBoot -eq 0) {'SecureBoot disabled'} else {'SecureBoot state unknown'}
+        $conversion = $null
+        $percentage = $null
+        $protection = $null
+        $source = ''
+
+        # This is the same volume status exposed by Windows Settings.
+        try {
+            $deviceVolume = Get-BitLockerVolume -MountPoint $systemDrive -ErrorAction Stop
+            $conversion = switch ([string]$deviceVolume.VolumeStatus) {
+                'FullyDecrypted' { 0 }
+                'FullyEncrypted' { 1 }
+                'EncryptionInProgress' { 2 }
+                'DecryptionInProgress' { 3 }
+                'EncryptionPaused' { 4 }
+                'DecryptionPaused' { 5 }
+                default { $null }
+            }
+            $percentage = [int]$deviceVolume.EncryptionPercentage
+            $protection = switch ([string]$deviceVolume.ProtectionStatus) {
+                'Off' { 0 }
+                'On' { 1 }
+                default { 2 }
+            }
+            $source = 'Get-BitLockerVolume'
+        } catch {
             $volume = Get-CimInstance -Namespace 'root/CIMV2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$systemDrive'" -ErrorAction Stop
-            $conversionText = switch ([int]$volume.ConversionStatus) {
-                0 { 'Fully decrypted' }
-                1 { 'Fully encrypted' }
-                2 { 'Encryption in progress' }
-                3 { 'Decryption in progress' }
-                4 { 'Encryption paused' }
-                5 { 'Decryption paused' }
-                default { "Unknown ($($volume.ConversionStatus))" }
-            }
-            $protectionText = switch ([int]$volume.ProtectionStatus) {
-                0 { 'off' }
-                1 { 'on' }
-                2 { 'unknown' }
-                default { "unknown ($($volume.ProtectionStatus))" }
-            }
-            $devEncValue = "Home edition (SKU $sku); Drive=$systemDrive; ConversionStatus=$conversionText; ProtectionStatus=$protectionText; $sbText"
-            if ([int]$volume.ConversionStatus -eq 1 -and [int]$volume.ProtectionStatus -eq 1) {
-                Add-Result 'Device Encryption (Windows Home alternative)' 'OK' $devEncValue 'Encryption and protection reported by Win32_EncryptableVolume.'
-            } elseif ([int]$volume.ConversionStatus -eq 0 -or [int]$volume.ProtectionStatus -eq 0) {
-                Add-Result 'Device Encryption (Windows Home alternative)' 'NOT OK' $devEncValue 'Device Encryption is not fully enabled on the system drive.'
-            } else {
-                Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' $devEncValue 'Device Encryption is transitioning or the status could not be interpreted.'
-            }
+            $conversionResult = Invoke-CimMethod -InputObject $volume -MethodName GetConversionStatus -ErrorAction Stop
+            $protectionResult = Invoke-CimMethod -InputObject $volume -MethodName GetProtectionStatus -ErrorAction Stop
+            $conversion = [int]$conversionResult.ConversionStatus
+            $percentage = [int]$conversionResult.EncryptionPercentage
+            $protection = [int]$protectionResult.ProtectionStatus
+            $source = 'Win32_EncryptableVolume'
+        }
+
+        $conversionText = switch ($conversion) {
+            0 { 'Fully decrypted' }
+            1 { 'Fully encrypted' }
+            2 { 'Encryption in progress' }
+            3 { 'Decryption in progress' }
+            4 { 'Encryption paused' }
+            5 { 'Decryption paused' }
+            default { "Unknown ($conversion)" }
+        }
+        $protectionText = switch ($protection) {
+            0 { 'off' }
+            1 { 'on' }
+            2 { 'unknown' }
+            default { "unknown ($protection)" }
+        }
+        $editionText = if ($sku -eq 101) { 'Home edition' } else { "OS SKU $sku" }
+        $devEncValue = "$editionText; Drive=$systemDrive; ConversionStatus=$conversionText; EncryptionPercentage=$percentage; ProtectionStatus=$protectionText; Source=$source; $sbText"
+        if ($conversion -eq 1 -and $protection -eq 1 -and $percentage -eq 100) {
+            Add-Result 'Device Encryption (Windows Home alternative)' 'OK' $devEncValue 'Encryption and protection are enabled on the system drive.'
+        } elseif ($conversion -eq 0 -or $protection -eq 0) {
+            Add-Result 'Device Encryption (Windows Home alternative)' 'NOT OK' $devEncValue 'Device Encryption is not enabled on the system drive.'
+        } else {
+            Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' $devEncValue 'Device Encryption is transitioning or the status could not be interpreted.'
         }
     } catch {
-        if ($sku -eq 101) {
-            Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' '' 'Win32_EncryptableVolume could not report Device Encryption status; the feature may be unavailable or permissions may be missing.'
+        # BitLocker cmdlets and WMI commonly require elevation. Explorer exposes
+        # the volume protection state through the Windows property system even
+        # for a standard user, so use it as a read-only fallback.
+        try {
+            $shell = New-Object -ComObject Shell.Application
+            $shellVolume = $shell.Namespace("$systemDrive\").Self
+            $shellProtection = $shellVolume.ExtendedProperty('System.Volume.BitLockerProtection')
+            $devEncValue = "Drive=$systemDrive; Explorer BitLockerProtection=$shellProtection; $sbText"
+            if ([string]$shellProtection -eq '1') {
+                Add-Result 'Device Encryption (Windows Home alternative)' 'OK' $devEncValue 'Read from the Windows volume property system because BitLocker/WMI status required elevation.'
+            } elseif ([string]$shellProtection -eq '0') {
+                Add-Result 'Device Encryption (Windows Home alternative)' 'NOT OK' $devEncValue 'Windows reports that Device Encryption is not enabled.'
+            } else {
+                Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' $devEncValue 'The volume property system returned an unrecognized encryption state.'
+            }
+        } catch {
+            Add-Result 'Device Encryption (Windows Home alternative)' 'UNKNOWN' '' 'The system-drive encryption provider could not report status; permissions or the BitLocker/WMI provider may be unavailable.'
         }
     }
 
