@@ -19,6 +19,10 @@ exit /b %RC%
 # Replace this with the KB number your IT team requires.
 # Example only: KB5060000 is NOT a recommendation for a current update.
 $RequiredKB = 'KB5127648'
+# Minimum supported Windows 11 release. Use a release label such as 23H2 or 24H2.
+$RequiredWindowsVersion = '26H2'
+# Minimum supported Citrix Workspace version, as reported by uninstall registry data.
+$RequiredCitrixWorkspaceVersion = '26.7.1.4'
 
 # Reports are saved in the current user's Documents folder.
 # ========================================================
@@ -62,6 +66,14 @@ function Protect-CsvValue {
         return "'$Value"
     }
     return $Value
+}
+
+function Get-WindowsReleaseRank {
+    param([string]$Release)
+    if ($Release -match '^(\d{2})H([12])$') {
+        return ([int]$matches[1] * 10) + [int]$matches[2]
+    }
+    return $null
 }
 
 function Get-RegistryUninstallEntries {
@@ -365,9 +377,29 @@ try {
     # Windows version / build
     $os = Get-CimInstance Win32_OperatingSystem
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    $winValue = "$($os.Caption); version $($cv.DisplayVersion); build $($os.BuildNumber)"
-    $winStatus = if ($os.Caption -match '^Microsoft Windows 11\b') { 'OK' } else { 'NOT OK' }
-    Add-Result 'Windows version' $winStatus $winValue 'The check requires a Microsoft Windows 11 client operating system.'
+    $winRelease = [string]$cv.DisplayVersion
+    if (-not $winRelease) { $winRelease = [string]$cv.ReleaseId }
+    $winValue = "$($os.Caption); version $winRelease; build $($os.BuildNumber)"
+    $requiredWinRelease = $RequiredWindowsVersion.Trim().ToUpperInvariant()
+    $actualWinRank = Get-WindowsReleaseRank $winRelease.ToUpperInvariant()
+    $requiredWinRank = Get-WindowsReleaseRank $requiredWinRelease
+    if ($os.Caption -notmatch '^Microsoft Windows 11\b') {
+        $winStatus = 'NOT OK'
+        $winNote = 'The check requires a Microsoft Windows 11 client operating system.'
+    } elseif ($null -eq $requiredWinRank) {
+        $winStatus = 'UNKNOWN'
+        $winNote = "Required Windows version '$RequiredWindowsVersion' is invalid; use a value such as 23H2 or 24H2."
+    } elseif ($null -eq $actualWinRank) {
+        $winStatus = 'UNKNOWN'
+        $winNote = "Installed Windows release '$winRelease' could not be compared with the configured minimum '$requiredWinRelease'."
+    } elseif ($actualWinRank -ge $requiredWinRank) {
+        $winStatus = 'OK'
+        $winNote = "Requires Windows 11 $requiredWinRelease or newer."
+    } else {
+        $winStatus = 'NOT OK'
+        $winNote = "Requires Windows 11 $requiredWinRelease or newer."
+    }
+    Add-Result 'Windows version' $winStatus $winValue $winNote
 
     # Antivirus products registered with Windows Security Center
     $avProducts = @()
@@ -696,14 +728,34 @@ try {
         Add-Result 'uBlock extension enabled' $browserResult.Status $browserResult.Value $browserResult.Notes
     }
 
-    # Citrix Workspace app version
+    # Minimum Citrix Workspace app version
     $citrix = @(Get-RegistryUninstallEntries | Where-Object { $_.DisplayName -match 'Citrix Workspace' } |
         Sort-Object DisplayVersion -Descending)
-    if ($citrix.Count -gt 0) {
-        $versions = @($citrix | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)" } | Select-Object -Unique)
-        Add-Result 'Citrix Workspace version' 'OK' ($versions -join '; ') 'Version found in uninstall registry data; per-user or non-standard installations may be missing.'
+    $requiredCitrix = $null
+    try { $requiredCitrix = [version]$RequiredCitrixWorkspaceVersion.Trim() } catch {}
+    if ($null -eq $requiredCitrix) {
+        Add-Result 'Citrix Workspace version' 'UNKNOWN' $RequiredCitrixWorkspaceVersion 'The configured minimum Citrix Workspace version is invalid; use a dotted version such as 24.02.0.0.'
+    } elseif ($citrix.Count -gt 0) {
+        $citrixDetails = @()
+        $comparableVersions = @()
+        foreach ($entry in $citrix) {
+            $displayVersion = [string]$entry.DisplayVersion
+            $citrixDetails += "$($entry.DisplayName) $displayVersion".Trim()
+            try {
+                $parsedVersion = [version]$displayVersion
+                $comparableVersions += [pscustomobject]@{ Display = $displayVersion; Version = $parsedVersion }
+            } catch {}
+        }
+        $bestCitrix = $comparableVersions | Sort-Object Version -Descending | Select-Object -First 1
+        if ($null -eq $bestCitrix) {
+            Add-Result 'Citrix Workspace version' 'UNKNOWN' ($citrixDetails -join '; ') 'Citrix Workspace was found, but no installed version could be parsed.'
+        } elseif ($bestCitrix.Version -ge $requiredCitrix) {
+            Add-Result 'Citrix Workspace version' 'OK' ($citrixDetails -join '; ') "Requires Citrix Workspace $RequiredCitrixWorkspaceVersion or newer."
+        } else {
+            Add-Result 'Citrix Workspace version' 'NOT OK' ($citrixDetails -join '; ') "Requires Citrix Workspace $RequiredCitrixWorkspaceVersion or newer."
+        }
     } else {
-        Add-Result 'Citrix Workspace version' 'NOT APPLICABLE' 'Not found' 'Citrix Workspace does not appear to be installed for the examined registry locations.'
+        Add-Result 'Citrix Workspace version' 'NOT OK' 'Not found' "Requires Citrix Workspace $RequiredCitrixWorkspaceVersion or newer; no installation was found in the examined registry locations."
     }
 
     # Number of local Windows user accounts
